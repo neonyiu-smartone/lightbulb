@@ -1,0 +1,62 @@
+# You can override the included template(s) by including variable overrides
+# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
+# Secret Detection customization: https://docs.gitlab.com/ee/user/application_security/secret_detection/pipeline/#customization
+# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
+# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
+# Note that environment variables can be set in several places
+# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+stages:
+  - build-frontend
+  - build-image
+  - deploy
+
+variables:
+  VAULT_JWT_ROLE: lightbulb-production-ci
+  REGISTRY: harbor.nova.hksmartone.com/gitlab
+
+
+build-frontend:
+  image: harbor.nova.hksmartone.com/gitlab/base-images/nodejs
+  stage: build-frontend
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    CI: false
+  script:
+    - cd frontend
+    - npm install
+    - npm run build
+  artifacts:
+    paths:
+      - frontend/dist
+
+build-image:
+  image:
+    name: harbor.nova.hksmartone.com/gitlab/base-images/buildah:latest
+  stage: build-image
+  before_script:
+    - buildah login "${HARBOR_URL}" -u "${HARBOR_USERNAME}" -p "${HARBOR_PASSWORD}"
+  script:
+    - buildah build -t "$REGISTRY/pm_service/$CI_PROJECT_NAME:${CI_COMMIT_TAG}" .;
+    - buildah push "$REGISTRY/pm_service/$CI_PROJECT_NAME:${CI_COMMIT_TAG}";
+  rules:
+    - if: $CI_COMMIT_TAG
+
+deploy:
+  image:
+    name: harbor.nova.hksmartone.com/gitlab/base-images/kubectl-helm:latest
+  stage: deploy
+  id_tokens:
+    VAULT_AUTH_TOKEN:
+      aud: https://gitlab.nova.hksmartone.com
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - yessir upgrade 0.2.7
+    - export ROLE_ID=$(yessir secret read auth/approle/role/lightbulb-production/role-id {{.Data.role_id}})
+    - export SECRET_ID=$(yessir secret write auth/approle/role/lightbulb-production/secret-id null {{.Data.secret_id}})
+    - helm upgrade --install lightbulb --set=image.tag=${CI_COMMIT_TAG} --set=appRole.roleId=${ROLE_ID} --set=appRole.secretId=${SECRET_ID} --atomic ./chart -n app
+  environment:
+    name: production
+    url: https://lightbulb.nova.hksmartone.com
+

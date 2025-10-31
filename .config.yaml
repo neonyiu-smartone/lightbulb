@@ -1,0 +1,14 @@
+production:
+  environment: production
+  usePrivateRegistry: false
+  # permit CI role access if CI pipeline is triggered by a commit on branch starting with "test-"
+  buildRef: "*"
+  buildRefType: tag
+  # this section only defined permission. Switching between different secrets seamlessly requires logic changes.
+  appRoleAccess:
+    readable:
+#      - kv/data/clickhouse/pmai-production
+    updatable: []
+  ciAccess:
+    readable: []
+    updatable: []

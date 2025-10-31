@@ -1,0 +1,172 @@
+statusSchema:
+  code:                # integer or string, standardized across all services
+    0: "OK"            # healthy, all checks passed
+    1: "DEGRADED"      # running but with warnings or partial failures
+    2: "FAILED"        # not running, critical failure
+    3: "STARTING"      # initializing, not yet ready
+    4: "STOPPED"       # intentionally stopped, not an error
+    5: "UNKNOWN"       # unable to determine status
+
+  stack:              # service stack, e.g. temporal, python, api, website
+    - temporal
+    - python
+    - restapi
+    - website
+
+  monitorFields:
+    - service_id       # unique identifier for the service
+    - timestamp        # when the status was checked
+    - code             # status code (see above)
+    - message          # human-readable status message
+    - details          # optional, any extra info (e.g. error logs, metrics)
+
+  examples:
+    - service_id: "temporal-1"
+      stack: "temporal"
+      timestamp: "2025-07-11T12:00:00Z"
+      code: 0
+      message: "Workflow running normally"
+      details: {}
+    - service_id: "api-2"
+      stack: "api"
+      timestamp: "2025-07-11T12:00:00Z"
+      code: 2
+      message: "API endpoint unreachable"
+      details:
+        error: "Connection timeout"
+    - service_id: "website-3"
+      stack: "website"
+      timestamp: "2025-07-11T12:00:00Z"
+      code: 1
+      message: "Website slow response"
+      details:
+        response_time_ms: 2500
+
+serviceNodes:
+  - id: "platform-0"
+    label: "ClickHouse"
+    type: "platform"
+    status:
+      - type: ping
+        url: "http://chi-internal-smc.db.svc.cluster.local:8123/ping"
+      - type: clickhouse
+        sql: "select 1"
+      - type: clickhouse
+        sql: "CREATE TABLE IF NOT EXISTS default.heath_test ON CLUSTER production (id UInt64, name String) ENGINE = ReplicatedMergeTree ORDER BY id;"
+    metric:
+      - name: "disk usage"
+        type: "clickhouse"
+        sql: "SELECT count() FROM system.tables WHERE database = 'default' AND name = 'heath_test';"
+      - name: "current merge"
+        type: "clickhouse"
+        sql: ""
+      - name: "current merges"
+        type: "clickhouse"
+        sql: ""
+      - name: "current mutations"
+        type: "clickhouse"
+        sql: ""
+      - name: "replicated table by delay"
+        type: "clickhouse"
+        sql: ""
+
+  - id: "pipeline-1"
+    label: "Radio Node Statistic"
+    type: "pipeline"
+    status:
+      - type: "temporal"
+        action: "last_run_succeeded"
+        host: ""
+        workflow: ""
+    metric:
+      - name: "replicated table by delay"
+        type: "clickhouse"
+        sql: ""
+      - type: "temporal"
+        action: "last_success_run"
+        host: ""
+        workflow: ""
+      - type: "temporal"
+        action: "last_success_run"
+        host: ""
+        workflow: ""
+
+  - id: "pipeline-2"
+    label: "EBS Statistic"
+    type: "Pipeline"
+    status:
+      - type: temporal
+        host: ""
+        workflow: ""
+    metric:
+
+  - id: "table-users"
+    label: "Users Table"
+    type: "Table"
+    status:
+      - type: clickhouse
+        sql: "SELECT 1 FROM system.tables WHERE database = 'default' AND name = 'users'"
+      - type: clickhouse
+        sql: "SELECT count() FROM default.users LIMIT 1"
+    metric:
+      - name: "row count"
+        type: "clickhouse"
+        sql: "SELECT count() FROM default.users"
+      - name: "table size"
+        type: "clickhouse"
+        sql: "SELECT formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE database = 'default' AND table = 'users'"
+
+  - id: "table-transactions"
+    label: "Transactions Table"
+    type: "Table"
+    status:
+      - type: clickhouse
+        sql: "SELECT 1 FROM system.tables WHERE database = 'default' AND name = 'transactions'"
+      - type: clickhouse
+        sql: "SELECT count() FROM default.transactions WHERE date = today() LIMIT 1"
+    metric:
+      - name: "daily transactions"
+        type: "clickhouse"
+        sql: "SELECT count() FROM default.transactions WHERE date = today()"
+      - name: "table size"
+        type: "clickhouse"
+        sql: "SELECT formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE database = 'default' AND table = 'transactions'"
+
+  - id: "table-metrics"
+    label: "Service Metrics Table"
+    type: "Table"
+    status:
+      - type: clickhouse
+        sql: "SELECT 1 FROM system.tables WHERE database = 'default' AND name = 'service_metrics'"
+    metric:
+      - name: "recent entries"
+        type: "clickhouse"
+        sql: "SELECT count() FROM default.service_metrics WHERE timestamp > now() - INTERVAL 1 HOUR"
+
+serviceRelations:
+  - id: "platform-0-pipeline-1"
+    source: "platform-0"
+    target: "pipeline-1"
+  - id: "platform-0-pipeline-2"
+    source: "platform-0"
+    target: "pipeline-2"
+  # Table dependencies - showing how tables depend on the platform
+  - id: "platform-0-table-users"
+    source: "platform-0"
+    target: "table-users"
+  - id: "platform-0-table-transactions"
+    source: "platform-0"
+    target: "table-transactions"
+  - id: "platform-0-table-metrics"
+    source: "platform-0"
+    target: "table-metrics"
+  # Service dependencies on tables - showing how pipelines depend on specific tables
+  - id: "table-users-pipeline-1"
+    source: "table-users"
+    target: "pipeline-1"
+  - id: "table-transactions-pipeline-2"
+    source: "table-transactions"
+    target: "pipeline-2"
+  - id: "table-metrics-pipeline-1"
+    source: "table-metrics"
+    target: "pipeline-1"

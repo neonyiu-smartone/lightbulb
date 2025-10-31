@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "server"
+version = "0.1.0"
+description = ""
+authors = ["Neon Yiu <neon_yiu@smartone.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pony = "^0.7.17"
+pmconnector = "0.6.0"
+clickhouse-driver = "^0.2.8"
+psycopg2 = "^2.9.9"
+apscheduler = "^3.10.4"
+smbprotocol = "^1.13.0"
+temporalio = "^1.11.0"
+fastapi = {extras = ["standard"], version = "^0.115.14"}
+
+sse-starlette = "^3.0.2"
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "pmteam"
+url = "https://gitlab.nova.hksmartone.com/api/v4/groups/smartone/-/packages/pypi/simple"
+priority = "supplemental"
