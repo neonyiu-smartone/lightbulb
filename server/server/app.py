@@ -27,6 +27,22 @@ from pmconnector import ResourceConnector
 from inspectTemporalWorkflow import WorkflowStatusReport
 from temporalio.client import Client
 
+
+class AlertmanagerAlert(BaseModel):
+    status: str  # 'firing' or 'resolved'
+    labels: Dict[str, str]
+    annotations: Dict[str, str]
+    startsAt: str
+    endsAt: Optional[str] = None
+    fingerprint: str
+
+
+class AlertmanagerPayload(BaseModel):
+    alerts: List[AlertmanagerAlert]
+    groupKey: str
+    status: str
+    externalURL: str
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -215,6 +231,103 @@ def send_alert(email: str,
             logging.error("Failed to send alert placeholder for %s: %s", email, response.text)
     except Exception as exc:
         logging.error("Error calling alert webhook for %s: %s", email, exc)
+
+
+def process_alert_update(client: Any, service_id: str, status_code: int, message: str) -> None:
+    """Update service status based on alert firing/resolved state."""
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Insert the status update into ClickHouse
+    insert_query = """
+    INSERT INTO monitor.service_status 
+    (service_id, time, status_code, message)
+    VALUES ('{service_id}', '{time}', {status_code}, '{message}')
+    """.format(
+        service_id=service_id,
+        time=current_time,
+        status_code=status_code,
+        message=message.replace("'", "\\'"),  # Escape single quotes
+    )
+    
+    client.execute(insert_query)
+    logging.info(f"Alert-driven status update for service '{service_id}': status_code={status_code}, message='{message}'")
+
+
+def ensure_service_exists(client: Any, alert: AlertmanagerAlert, service_id: str) -> None:
+    """Create a minimal service record when alerts reference unknown services."""
+    sanitized_service_id = service_id.replace("'", "''")
+    check_query = f"""
+    SELECT count()
+    FROM monitor.services
+    WHERE service_id = '{sanitized_service_id}'
+    """
+
+    result = client.execute(check_query)
+    if result and result[0][0] > 0:
+        return
+
+    label = service_id.replace("'", "''")
+    service_type = 'Application'
+    status_config = alert.annotations.get('status_config', '{}') or '{}'
+    metric_config = alert.annotations.get('metric_config', '{}') or '{}'
+
+    insert_query = """
+    INSERT INTO monitor.services 
+    (service_id, label, service_type, status_config, metric_config, enabled, created_at, updated_at)
+    VALUES ('{service_id}', '{label}', '{service_type}', '{status_config}', '{metric_config}', 1, now(), now())
+    """.format(
+        service_id=sanitized_service_id,
+        label=label,
+        service_type=service_type,
+        status_config=status_config.replace("'", "''"),
+        metric_config=metric_config.replace("'", "''")
+    )
+
+    client.execute(insert_query)
+    logging.info(f"Auto-created service '{service_id}' from Prometheus alert")
+
+
+def translate_alert_to_status(alert: AlertmanagerAlert) -> tuple[str, int, str]:
+    """Extract service ID, status code, and message from Alertmanager alert."""
+    fallback_keys = [
+        'service_id',
+        'service',
+        'job',
+        'app',
+        'component',
+        'kubernetes_service_name',
+        'kubernetes_pod_name',
+        'pod',
+        'instance'
+    ]
+
+    service_id = None
+    for key in fallback_keys:
+        candidate = alert.labels.get(key)
+        if candidate:
+            service_id = candidate
+            break
+
+    if not service_id:
+        service_id = f"alert-{alert.fingerprint}"
+    
+    if alert.status == 'resolved':
+        status_code = 0  # OK
+        message = f"Alert resolved: {alert.labels.get('alertname', 'unknown')}"
+    else:  # firing
+        severity = alert.labels.get('severity', 'warning').lower()
+        alertname = alert.labels.get('alertname', 'unknown')
+        
+        if severity in ['critical', 'high']:
+            status_code = 2  # FAILED
+        elif severity in ['info']:
+            status_code = 0  # OK
+        else:
+            status_code = 1  # DEGRADED
+
+        message = f"Alert firing: {alertname} - {alert.annotations.get('summary', 'No summary')}"
+    
+    return service_id, status_code, message
 
 
 def notify_watchers_for_failure(client: Any, failing_service_id: str, status_code: int, message: str) -> None:
@@ -1310,15 +1423,39 @@ def delete_relation(relation_id: str):
             detail=f"Failed to delete relation: {str(e)}"
         )
 
+
+@app.post('/api/alerts/prometheus')
+async def receive_prometheus_alerts(payload: AlertmanagerPayload):
+    """Receive alerts from Prometheus Alertmanager and update service status."""
+    try:
+        client = ResourceConnector().connect_clickhouse_static('monitor')
+        
+        # Process each alert in the batch
+        for alert in payload.alerts:
+            service_id, status_code, message = translate_alert_to_status(alert)
+            
+            # Skip if we can't determine service_id
+            ensure_service_exists(client, alert, service_id)
+            # Update status in ClickHouse
+            process_alert_update(client, service_id, status_code, message)
+        
+        return {"message": f"Processed {len(payload.alerts)} alerts"}
+        
+    except Exception as e:
+        logging.error(f"Failed to process Prometheus alerts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process alerts: {str(e)}"
+        )
+
 async def periodic_workflow_report():
     while True:
         try:
-            if datetime.now().minute % 5 == 0:
-                client: Client = await Client.connect("temporal-frontend-headless.temporal.svc.cluster.local:7233",
-                                                      namespace="default")
-                report_endpoint = 'http://localhost:14306' 
-                status_report = WorkflowStatusReport(client, report_endpoint)
-                await status_report.run_report_status()
+            client: Client = await Client.connect("temporal-frontend-headless.temporal.svc.cluster.local:7233",
+                                                    namespace="default")
+            report_endpoint = 'http://localhost:14306' 
+            status_report = WorkflowStatusReport(client, report_endpoint)
+            await status_report.run_report_status()
             
             await asyncio.sleep(60)
 
