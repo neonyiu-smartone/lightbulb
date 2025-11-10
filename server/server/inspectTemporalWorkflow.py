@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
 import httpx
@@ -32,8 +32,10 @@ class WorkflowMonitor(BaseModel):
     dashboard_id: str
     schedule_id: Optional[str] = None
     interval_minute: int = 15
+    is_paused: bool = False
+    start_offset_minute: int = 0
+    task_queue: Optional[str] = None
 
-# it seems that the workflow status is not being reported correctly
 
 class WorkflowStatusReport:
     def __init__(
@@ -57,35 +59,203 @@ class WorkflowStatusReport:
                 self.clickhouse_client = None
 
     @staticmethod
-    def extract_interval_minutes(schedule_entry: Any) -> Optional[int]:
-        """Derive schedule interval (in minutes) from a Temporal schedule list entry."""
+    def extract_interval_metadata(schedule_entry: Any) -> tuple[Optional[int], Optional[int]]:
+        """Return interval minutes and start offset from Temporal schedule."""
+        interval_minutes = None
+        start_offset = None
+
         schedule = getattr(schedule_entry, 'schedule', None)
-        if schedule is None:
+        if schedule is not None:
+            intervals = getattr(schedule, 'intervals', None)
+            if not intervals:
+                spec = getattr(schedule, 'spec', None)
+                intervals = getattr(spec, 'intervals', None) if spec else None
+
+            if intervals:
+                best_seconds: Optional[float] = None
+                for interval in intervals:
+                    every = getattr(interval, 'every', None)
+                    if every is None or not hasattr(every, 'total_seconds'):
+                        continue
+                    seconds = every.total_seconds()
+                    if seconds <= 0:
+                        continue
+                    if best_seconds is None or seconds < best_seconds:
+                        best_seconds = seconds
+
+                if best_seconds is not None:
+                    interval_minutes = max(int(best_seconds // 60) or 1, 1)
+
+        info = getattr(schedule_entry, 'info', None)
+
+        candidate_times: list[datetime] = []
+        if info is not None:
+            primary_iterable = getattr(info, 'next_action_times', None)
+            if primary_iterable:
+                candidate_times.extend([
+                    dt for dt in primary_iterable
+                    if isinstance(dt, datetime)
+                ])
+
+            future_iterable = getattr(info, 'future_action_times', None)
+            if future_iterable:
+                candidate_times.extend([
+                    dt for dt in future_iterable
+                    if isinstance(dt, datetime)
+                ])
+
+        if not candidate_times and info is not None:
+            recent_actions = getattr(info, 'recent_actions', None)
+            if recent_actions:
+                for action in recent_actions[:3]:
+                    scheduled_time = getattr(action, 'scheduled_at', None)
+                    if not isinstance(scheduled_time, datetime):
+                        scheduled_time = getattr(action, 'scheduled_time', None)
+                    if isinstance(scheduled_time, datetime):
+                        candidate_times.append(scheduled_time)
+
+        candidate_times = sorted({dt for dt in candidate_times if isinstance(dt, datetime)})
+
+        if len(candidate_times) >= 2:
+            deltas = [
+                (b - a).total_seconds()
+                for a, b in zip(candidate_times, candidate_times[1:])
+                if (b - a).total_seconds() > 0
+            ]
+            if deltas:
+                seconds = min(deltas)
+                interval_minutes = interval_minutes or max(int(seconds // 60) or 1, 1)
+
+        first_total_minutes: Optional[int] = None
+        if candidate_times:
+            first = candidate_times[0]
+            if first.tzinfo is not None:
+                first_utc = first.astimezone(timezone.utc)
+            else:
+                first_utc = first.replace(tzinfo=timezone.utc)
+
+            reference = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            first_total_minutes = int((first_utc - reference).total_seconds() // 60)
+
+            if interval_minutes is not None and interval_minutes > 0:
+                start_offset = first_total_minutes % interval_minutes
+
+        if interval_minutes is None:
+            inferred = WorkflowStatusReport._infer_interval_from_history(candidate_times)
+            if inferred:
+                interval_minutes = inferred
+
+        if interval_minutes is not None and interval_minutes > 0:
+            if first_total_minutes is not None:
+                start_offset = first_total_minutes % interval_minutes
+            elif start_offset is not None:
+                start_offset %= interval_minutes
+
+        return interval_minutes, start_offset
+
+    @staticmethod
+    def _infer_interval_from_history(candidate_times: List[datetime]) -> Optional[int]:
+        """Approximate interval using candidate execution timestamps."""
+        candidate_times = sorted({dt for dt in candidate_times if isinstance(dt, datetime)})
+        if len(candidate_times) < 2:
             return None
 
-        intervals = getattr(schedule, 'intervals', None)
-        if not intervals:
-            spec = getattr(schedule, 'spec', None)
-            intervals = getattr(spec, 'intervals', None) if spec else None
+        deltas = [
+            (b - a).total_seconds()
+            for a, b in zip(candidate_times, candidate_times[1:])
+            if (b - a).total_seconds() > 0
+        ]
 
-        if not intervals:
+        if not deltas:
             return None
 
-        best_seconds: Optional[float] = None
-        for interval in intervals:
-            every = getattr(interval, 'every', None)
-            if every is None or not hasattr(every, 'total_seconds'):
+        best_seconds = min(deltas)
+        inferred_minutes = max(int(best_seconds // 60) or 1, 1)
+        return inferred_minutes
+
+    @staticmethod
+    def _collect_datetime_values(values: Any) -> list[datetime]:
+        """Normalize iterable datetime values to UTC-aware datetimes."""
+        collected: list[datetime] = []
+        if not values:
+            return collected
+
+        try:
+            iterator = list(values)
+        except TypeError:
+            return collected
+
+        for dt_value in iterator:
+            if not isinstance(dt_value, datetime):
                 continue
-            seconds = every.total_seconds()
-            if seconds <= 0:
-                continue
-            if best_seconds is None or seconds < best_seconds:
-                best_seconds = seconds
+            if dt_value.tzinfo is None:
+                collected.append(dt_value.replace(tzinfo=timezone.utc))
+            else:
+                collected.append(dt_value.astimezone(timezone.utc))
+        return collected
 
-        if best_seconds is None:
-            return None
+    @staticmethod
+    def _is_schedule_paused(
+        info: Any,
+        now_utc: Optional[datetime] = None,
+        precomputed_times: Optional[List[datetime]] = None,
+    ) -> bool:
+        """Determine whether a Temporal schedule should be treated as paused."""
+        if info is None:
+            return False
 
-        return max(int(best_seconds // 60) or 1, 1)
+        explicit_paused = getattr(info, 'paused', None)
+        paused_by = getattr(info, 'paused_by', None)
+        status_value = getattr(info, 'status', None)
+
+        status_name = None
+        if hasattr(status_value, 'name'):
+            status_name = getattr(status_value, 'name', None)
+        elif isinstance(status_value, str):
+            status_name = status_value
+
+        paused = bool(explicit_paused) or bool(paused_by)
+
+        if not paused and status_name is not None:
+            paused = status_name.upper() == 'SCHEDULE_STATUS_PAUSED'
+
+        if not paused and isinstance(status_value, int):
+            paused = status_value == 2
+
+        if paused:
+            return True
+
+        now = now_utc or datetime.now(timezone.utc)
+        tolerance = timedelta(minutes=5)
+
+        if precomputed_times is not None:
+            upcoming_candidates = [
+                dt_value.replace(tzinfo=timezone.utc)
+                if isinstance(dt_value, datetime) and dt_value.tzinfo is None
+                else dt_value.astimezone(timezone.utc)
+                for dt_value in precomputed_times
+                if isinstance(dt_value, datetime)
+            ]
+        else:
+            upcoming_candidates: list[datetime] = []
+            upcoming_candidates.extend(WorkflowStatusReport._collect_datetime_values(getattr(info, 'next_action_times', None)))
+            upcoming_candidates.extend(WorkflowStatusReport._collect_datetime_values(getattr(info, 'future_action_times', None)))
+
+            next_action = getattr(info, 'next_action_time', None)
+            if isinstance(next_action, datetime):
+                if next_action.tzinfo is None:
+                    upcoming_candidates.append(next_action.replace(tzinfo=timezone.utc))
+                else:
+                    upcoming_candidates.append(next_action.astimezone(timezone.utc))
+
+        if not upcoming_candidates:
+            return False
+
+        threshold = now - tolerance
+        if all(candidate < threshold for candidate in upcoming_candidates):
+            return True
+
+        return False
 
     def ensure_workflow_service(self, service_id: str) -> None:
         """Ensure a ClickHouse service row exists for the given workflow service id."""
@@ -146,6 +316,16 @@ class WorkflowStatusReport:
                 if isinstance(name_value, str):
                     type_candidates.append(name_value)
 
+            if not type_candidates:
+                args = getattr(start_workflow, 'arguments', None) or getattr(start_workflow, 'args', None)
+                if isinstance(args, (list, tuple)):
+                    for value in args:
+                        if isinstance(value, dict):
+                            potential = value.get('workflowType') or value.get('workflow_type')
+                            if isinstance(potential, str):
+                                type_candidates.append(potential)
+                                break
+
         if not type_candidates and hasattr(schedule_entry, 'id'):
             id_value = getattr(schedule_entry, 'id', '')
             if isinstance(id_value, str):
@@ -158,6 +338,158 @@ class WorkflowStatusReport:
 
         return None
 
+    @staticmethod
+    def extract_task_queue(schedule_entry: Any) -> Optional[str]:
+        """Extract task queue from schedule entry when available."""
+        schedule = getattr(schedule_entry, 'schedule', None)
+        if schedule is None:
+            return None
+
+        action = getattr(schedule, 'action', None)
+        start_workflow = getattr(action, 'start_workflow', None) if action else None
+        if start_workflow is None:
+            return None
+
+        task_queue = getattr(start_workflow, 'task_queue', None)
+        if isinstance(task_queue, str) and task_queue.strip():
+            return task_queue.strip()
+
+        if hasattr(task_queue, 'name') and isinstance(getattr(task_queue, 'name'), str):
+            return getattr(task_queue, 'name').strip()
+
+        if isinstance(task_queue, dict):
+            queue_name = task_queue.get('name') or task_queue.get('task_queue')
+            if isinstance(queue_name, str) and queue_name.strip():
+                return queue_name.strip()
+
+        return None
+
+    async def log_schedule_snapshot(
+        self,
+        schedule_id: Optional[str],
+        schedule_entry: Any = None,
+        interval_minute: Optional[int] = None,
+        start_offset_minute: Optional[int] = None,
+    ) -> None:
+        """Log key schedule fields from Temporal for observability."""
+        if not schedule_id:
+            return
+
+        info = getattr(schedule_entry, 'info', None) if schedule_entry is not None else None
+        description = None
+
+        if info is None:
+            try:
+                handle = self.client.get_schedule_handle(schedule_id)
+                description = await handle.describe()
+                info = getattr(description, 'info', None)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Unable to describe schedule %s: %s", schedule_id, exc)
+                return
+
+        def compute_schedule_times(target_info: Any) -> tuple[list[datetime], list[datetime], Optional[datetime]]:
+            if target_info is None:
+                return [], [], None
+            next_list = self._collect_datetime_values(getattr(target_info, 'next_action_times', None))
+            future_list = self._collect_datetime_values(getattr(target_info, 'future_action_times', None))
+            next_action_value = getattr(target_info, 'next_action_time', None)
+            if isinstance(next_action_value, datetime):
+                if next_action_value.tzinfo is None:
+                    next_action_utc = next_action_value.replace(tzinfo=timezone.utc)
+                else:
+                    next_action_utc = next_action_value.astimezone(timezone.utc)
+            else:
+                next_action_utc = None
+            return next_list, future_list, next_action_utc
+
+        next_datetimes, future_datetimes, next_action_dt = compute_schedule_times(info)
+
+        if not future_datetimes and description is None and info is not None:
+            try:
+                handle = self.client.get_schedule_handle(schedule_id)
+                description = await handle.describe()
+                info = getattr(description, 'info', None)
+                next_datetimes, future_datetimes, next_action_dt = compute_schedule_times(info)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Unable to refresh schedule %s for future times: %s", schedule_id, exc)
+
+        last_completed = None
+        if info is not None:
+            completed_time = getattr(info, 'last_completed_action_time', None)
+            if isinstance(completed_time, datetime):
+                if completed_time.tzinfo is None:
+                    last_completed = completed_time.replace(tzinfo=timezone.utc).isoformat()
+                else:
+                    last_completed = completed_time.astimezone(timezone.utc).isoformat()
+
+        recent_info = None
+        if info is not None:
+            try:
+                recent_actions = getattr(info, 'recent_actions', None)
+                if recent_actions:
+                    recent_info = [
+                        {
+                            'scheduled_at': getattr(action, 'scheduled_at', None).isoformat()
+                            if isinstance(getattr(action, 'scheduled_at', None), datetime) else None,
+                            'started_at': getattr(action, 'started_at', None).isoformat()
+                            if isinstance(getattr(action, 'started_at', None), datetime) else None,
+                            'action_type': type(getattr(action, 'action', None)).__name__ if getattr(action, 'action', None) else None,
+                        }
+                        for action in recent_actions[:3]
+                    ]
+            except TypeError:
+                recent_info = None
+
+        recent_runs = recent_info or []
+        detected_interval, detected_offset = (None, None)
+        if schedule_entry is not None:
+            detected_interval, detected_offset = self.extract_interval_metadata(schedule_entry)
+
+        interval_value = interval_minute if interval_minute is not None else detected_interval
+        offset_value = start_offset_minute if start_offset_minute is not None else detected_offset
+
+        combined_upcoming: list[datetime] = []
+        seen_upcoming: set[str] = set()
+        for dt_value in next_datetimes + future_datetimes:
+            key = dt_value.isoformat()
+            if key in seen_upcoming:
+                continue
+            seen_upcoming.add(key)
+            combined_upcoming.append(dt_value)
+
+        if next_action_dt is not None:
+            key = next_action_dt.isoformat()
+            if key not in seen_upcoming:
+                combined_upcoming.append(next_action_dt)
+
+        paused = self._is_schedule_paused(info, precomputed_times=combined_upcoming)
+
+        def datetimes_to_strings(values: list[datetime], limit: int = 3) -> list[str]:
+            return [dt.isoformat() for dt in values[:limit]]
+
+        next_times = datetimes_to_strings(next_datetimes)
+        future_times = datetimes_to_strings(future_datetimes)
+
+        upcoming_preview = datetimes_to_strings(combined_upcoming)
+        next_action_iso = next_action_dt.isoformat() if next_action_dt is not None else None
+
+        recent_preview = [
+            f"{entry.get('scheduled_at')}/{entry.get('started_at')}"
+            for entry in recent_runs[:3]
+        ] if recent_runs else []
+
+        logger.info(
+            "Schedule %s paused=%s interval=%s offset=%s next=%s upcoming=%s last_completed=%s recent=%s",
+            schedule_id,
+            paused,
+            interval_value,
+            offset_value,
+            next_action_iso,
+            upcoming_preview,
+            last_completed,
+            recent_preview,
+        )
+
     async def sync_temporal_workflow_services(self) -> List[WorkflowMonitor]:
         """Sync Temporal schedules into ClickHouse services and build monitor list."""
         try:
@@ -167,11 +499,16 @@ class WorkflowStatusReport:
             return []
 
         monitors: List[WorkflowMonitor] = []
+        now_utc = datetime.now(timezone.utc)
         async for entry in schedules_iterator:
             schedule_id_raw = getattr(entry, 'id', None)
             schedule_id = schedule_id_raw if isinstance(schedule_id_raw, str) and schedule_id_raw else None
 
+            info = getattr(entry, 'info', None)
+            paused = self._is_schedule_paused(info, now_utc)
+
             workflow_type = self.extract_workflow_type(entry)
+            task_queue = self.extract_task_queue(entry)
             if not workflow_type:
                 if schedule_id:
                     logger.debug(
@@ -186,9 +523,34 @@ class WorkflowStatusReport:
                     )
                     continue
 
-            interval_minute = self.extract_interval_minutes(entry) or 15
-            service_id = workflow_type
             monitor_schedule_id = schedule_id or workflow_type
+            interval_meta, start_offset = self.extract_interval_metadata(entry)
+            interval_minute = interval_meta or 15
+            offset_minute = start_offset if start_offset is not None else 0
+            if start_offset is not None and interval_meta:
+                offset_minute = start_offset % interval_minute
+            elif interval_meta is not None and interval_meta > 0:
+                offset_minute %= interval_minute
+            else:
+                offset_minute %= interval_minute or 1
+
+            if interval_meta is None:
+                logger.debug(
+                    "Using default interval %d minutes for schedule %s (workflow type %s)",
+                    interval_minute,
+                    monitor_schedule_id,
+                    workflow_type,
+                )
+            else:
+                logger.debug(
+                    "Schedule %s (workflow type %s) interval set to %d minutes (offset %d)",
+                    monitor_schedule_id,
+                    workflow_type,
+                    interval_minute,
+                    offset_minute,
+                )
+
+            service_id = workflow_type
 
             self.ensure_workflow_service(service_id)
             monitors.append(
@@ -197,13 +559,19 @@ class WorkflowStatusReport:
                     dashboard_id=service_id,
                     schedule_id=monitor_schedule_id,
                     interval_minute=interval_minute,
+                    is_paused=paused,
+                    start_offset_minute=offset_minute,
+                    task_queue=task_queue,
                 )
             )
+
+            await self.log_schedule_snapshot(monitor_schedule_id, entry)
             logger.debug(
-                "Prepared monitor for schedule %s (workflow type %s) with interval %d minutes",
+                "Prepared monitor for schedule %s (workflow type %s) with interval %d minutes offset %d",
                 monitor_schedule_id,
                 workflow_type,
                 interval_minute,
+                offset_minute,
             )
 
         if monitors:
@@ -218,9 +586,10 @@ class WorkflowStatusReport:
             raise ValueError(f"Invalid workflow ID format: {workflow_id}")
         return datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S") + timedelta(hours=8)
 
-    def compute_monitor_window(self, interval_minute: int) -> tuple[datetime, datetime, timedelta]:
+    def compute_monitor_window(self, interval_minute: int, start_offset_minute: int = 0) -> tuple[datetime, datetime, timedelta]:
         """Return the monitoring window start, due time, and applied grace."""
         interval_minutes = max(interval_minute, 1)
+        offset = start_offset_minute % interval_minutes
         minute_aligned = self.monitor_time.replace(second=0, microsecond=0)
         reference = datetime(1970, 1, 1)
 
@@ -230,9 +599,15 @@ class WorkflowStatusReport:
             adjusted_time = reference
 
         elapsed_minutes = int((adjusted_time - reference).total_seconds() // 60)
-        period_index = elapsed_minutes // interval_minutes
-        due_time = reference + timedelta(minutes=period_index * interval_minutes)
+        offset_remainder = (elapsed_minutes - offset) % interval_minutes
+        due_minutes = elapsed_minutes - offset_remainder
+        if due_minutes < 0:
+            due_minutes = 0
+
+        due_time = reference + timedelta(minutes=due_minutes)
         window_start = due_time - timedelta(minutes=interval_minutes)
+        if window_start < reference:
+            window_start = reference
         return window_start, due_time, grace
 
     @staticmethod
@@ -266,6 +641,21 @@ class WorkflowStatusReport:
                     f'WorkflowType="{sanitized_type}"',
                 ))
 
+        queue_query_label = 'task_queue'
+        task_queue_filter = None
+        if hasattr(self, 'workflow_monitor_list') and self.workflow_monitor_list:
+            for monitor in self.workflow_monitor_list:
+                if monitor.schedule_id == schedule_id or monitor.workflow_type == workflow_type:
+                    if monitor.task_queue:
+                        task_queue_filter = monitor.task_queue.replace('"', '\"')
+                    break
+
+        if task_queue_filter:
+            queries.append((
+                queue_query_label,
+                f'TaskQueue="{task_queue_filter}"',
+            ))
+
         collected: dict[str, WorkflowInfo] = {}
 
         for label, query in queries:
@@ -283,10 +673,28 @@ class WorkflowStatusReport:
                     logger.debug("Skipping workflow execution %s with unparsable id", wf.id)
                     continue
 
+                info_payload = {
+                    'workflow_id': wf.id,
+                    'task_queue': getattr(wf, 'task_queue', None),
+                    'status': getattr(getattr(wf, 'status', None), 'name', None),
+                    'scheduled_at': scheduled_at.isoformat(),
+                    'window_start': window_start.isoformat(),
+                    'window_end': window_end.isoformat(),
+                    'filter': label,
+                }
+
                 if not self.check_workflow_schedule_time(scheduled_at, window_start, window_end):
+                    logger.debug(
+                        "Workflow outside monitoring window: %s",
+                        info_payload,
+                    )
                     continue
 
                 if wf.id in collected:
+                    logger.debug(
+                        "Workflow already collected for monitoring window: %s",
+                        info_payload,
+                    )
                     continue
 
                 collected[wf.id] = WorkflowInfo(
@@ -295,6 +703,10 @@ class WorkflowStatusReport:
                     status=wf.status.value,
                     status_name=wf.status.name,
                     scheduled_at=scheduled_at,
+                )
+                logger.debug(
+                    "Collected workflow execution for monitoring window: %s",
+                    info_payload,
                 )
 
         return list(collected.values())
@@ -317,7 +729,7 @@ class WorkflowStatusReport:
             logger.info("No workflow monitor configs available after sync; reporting run will skip")
 
     @staticmethod
-    def is_interval_due(current_time: datetime, interval_minute: int) -> bool:
+    def is_interval_due(current_time: datetime, interval_minute: int, start_offset_minute: int = 0) -> bool:
         minute_aligned = current_time.replace(second=0, microsecond=0)
         if interval_minute <= 0:
             return False
@@ -326,12 +738,17 @@ class WorkflowStatusReport:
         if elapsed_minutes < 0:
             return False
 
-        if interval_minute > 1440:
-            elapsed_minutes -= 120
-            if elapsed_minutes < 0:
-                return False
+        normalized_interval = max(interval_minute, 1)
+        offset = start_offset_minute % normalized_interval
+        adjusted_minutes = elapsed_minutes - offset
 
-        return elapsed_minutes % interval_minute == 0
+        if normalized_interval > 1440:
+            adjusted_minutes -= 120
+
+        if adjusted_minutes < 0:
+            return False
+
+        return adjusted_minutes % normalized_interval == 0
 
     async def report_status(
         self,
@@ -339,12 +756,20 @@ class WorkflowStatusReport:
         service_id: str,
         schedule_id: Optional[str],
         interval_minute: int = 15,
+        is_paused: bool = False,
+        start_offset_minute: int = 0,
     ):
         if not self.report_endpoint:
             logger.warning("Report endpoint not configured; skipping status for %s", service_id)
             return "skipped_no_endpoint"
 
-        window_start, due_time, grace = self.compute_monitor_window(interval_minute)
+        await self.log_schedule_snapshot(
+            schedule_id,
+            interval_minute=interval_minute,
+            start_offset_minute=start_offset_minute,
+        )
+
+        window_start, due_time, grace = self.compute_monitor_window(interval_minute, start_offset_minute)
         if interval_minute > 1440 and self.monitor_time < due_time + grace:
             logger.debug(
                 "Skipping workflow %s (schedule %s) monitoring until %s (within 2h grace)",
@@ -365,14 +790,24 @@ class WorkflowStatusReport:
         message = "Execution is delayed"
 
         logger.info(
-            "Evaluating workflow %s (service %s, schedule %s) interval=%d window=(%s -> %s)",
+            "Evaluating workflow %s (service %s, schedule %s) interval=%d offset=%d window=(%s -> %s) paused=%s",
             workflow_type,
             service_id,
             schedule_id or workflow_type,
             interval_minute,
+            start_offset_minute,
             window_start.isoformat(),
             due_time.isoformat(),
+            is_paused,
         )
+
+        if is_paused and not workflow_in_period:
+            logger.info(
+                "Skipping workflow %s (schedule %s) because schedule is paused and no runs found in window",
+                workflow_type,
+                schedule_id or workflow_type,
+            )
+            return "skipped_paused"
 
         if not workflow_in_period:
             logger.warning(
@@ -488,7 +923,11 @@ class WorkflowStatusReport:
 
         eligible_configs = [
             config for config in self.workflow_monitor_list
-            if self.is_interval_due(self.monitor_time, config.interval_minute)
+            if self.is_interval_due(
+                self.monitor_time,
+                config.interval_minute,
+                config.start_offset_minute,
+            )
         ]
 
         logger.info(
@@ -509,6 +948,8 @@ class WorkflowStatusReport:
                     config.dashboard_id,
                     config.schedule_id,
                     config.interval_minute,
+                    config.is_paused,
+                    config.start_offset_minute,
                 )
             )
             for config in eligible_configs
