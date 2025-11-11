@@ -2,7 +2,7 @@ import axios, { AxiosError } from 'axios'
 import { useQuery, type UseQueryOptions, type UseQueryResult } from '@tanstack/react-query'
 
 import { API_ROOT } from './constants.tsx'
-import { type ServiceNode, type ServiceRelation, type ServiceStatusSummary, type ServiceFailureRecord } from './model.tsx'
+import { type ServiceNode, type ServiceRelation, type ServiceStatusSummary, type ServiceFailureRecord, type WorkflowScheduleSnapshot } from './model.tsx'
 
 
 type HookOption<T, E, S = T> = UseQueryOptions<T, E, S, any>
@@ -39,6 +39,11 @@ export const fetchServiceStatus = async (serviceId: string, range?: StatusRange)
 export const fetchServiceFailures = async (serviceId: string, range?: StatusRange): Promise<ServiceFailureRecord[]> => {
     const query = buildRangeQuery(range)
     const { data } = await axios.get<ServiceFailureRecord[]>(`${API_ROOT}/status/${serviceId}/failures${query}`)
+    return data
+}
+
+export const fetchWorkflowScheduleSnapshot = async (serviceId: string): Promise<WorkflowScheduleSnapshot> => {
+    const { data } = await axios.get<WorkflowScheduleSnapshot>(`${API_ROOT}/api/workflows/${serviceId}/schedule`)
     return data
 }
 

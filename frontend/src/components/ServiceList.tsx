@@ -1,8 +1,8 @@
 import { memo, useMemo, useRef, useCallback, createContext, useContext, useState, useEffect } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import { useQueries } from '@tanstack/react-query';
-import { fetchServiceStatus } from '@/externalDataSources';
-import { type ServiceNode, type ServiceStatusSummary } from '@/model';
+import { fetchServiceStatus, fetchWorkflowScheduleSnapshot } from '@/externalDataSources';
+import { type ServiceNode, type ServiceStatusSummary, type WorkflowScheduleSnapshot } from '@/model';
 import { type ColDef, type GridApi, type GridReadyEvent, type ICellRendererParams, type GetRowIdParams, type RowGroupOpenedEvent } from 'ag-grid-community';
 
 type StatusSummaryCounts = {
@@ -16,12 +16,32 @@ type StatusSummaryCounts = {
     total: number;
 };
 
+type StatusMeta = {
+    isLoading: boolean;
+    isError: boolean;
+    error: unknown;
+};
+
+type ScheduleMeta = {
+    isLoading: boolean;
+    isError: boolean;
+};
+
 interface ServiceStatusContextValue {
     statusByService: Record<string, ServiceStatusSummary | undefined>;
     summaryByType: Record<string, StatusSummaryCounts>;
+    statusStateByService: Record<string, StatusMeta>;
+    scheduleByService: Record<string, WorkflowScheduleSnapshot | undefined>;
+    scheduleStateByService: Record<string, ScheduleMeta>;
 }
 
-const ServiceStatusContext = createContext<ServiceStatusContextValue>({ statusByService: {}, summaryByType: {} });
+const ServiceStatusContext = createContext<ServiceStatusContextValue>({
+    statusByService: {},
+    summaryByType: {},
+    statusStateByService: {},
+    scheduleByService: {},
+    scheduleStateByService: {},
+});
 
 const useServiceStatusContext = () => useContext(ServiceStatusContext);
 
@@ -39,8 +59,69 @@ const defaultSummaryCounts = (total: number): StatusSummaryCounts => ({
     total,
 });
 
+const parseTimestamp = (value?: string | null): number | null => {
+    if (!value) {
+        return null;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+};
+
+const formatHktDateTime = (isoString: string | null): { iso: string; label: string } | null => {
+    if (!isoString) {
+        return null;
+    }
+    const timestamp = parseTimestamp(isoString);
+    if (timestamp === null) {
+        return null;
+    }
+    const formatter = new Intl.DateTimeFormat('en-HK', {
+        timeZone: 'Asia/Hong_Kong',
+        dateStyle: 'medium',
+        timeStyle: 'short',
+    });
+    return {
+        iso: isoString,
+        label: formatter.format(timestamp),
+    };
+};
+
+const selectNextUpcomingAction = (
+    snapshot: WorkflowScheduleSnapshot,
+): { iso: string; timestamp: number } | null => {
+    const nowMs = Date.now();
+    const candidates: string[] = [];
+    if (snapshot.next_action_time) {
+        candidates.push(snapshot.next_action_time);
+    }
+    if (Array.isArray(snapshot.upcoming_action_times)) {
+        candidates.push(...snapshot.upcoming_action_times);
+    }
+    if (!candidates.length) {
+        return null;
+    }
+    const enriched = candidates
+        .map(entry => ({ entry, timestamp: parseTimestamp(entry) }))
+        .filter(item => item.timestamp !== null) as Array<{ entry: string; timestamp: number }>;
+    if (!enriched.length) {
+        return null;
+    }
+    const future = enriched.filter(item => item.timestamp >= nowMs).sort((a, b) => a.timestamp - b.timestamp);
+    if (future.length) {
+        return { iso: future[0].entry, timestamp: future[0].timestamp };
+    }
+    const pastSorted = enriched.sort((a, b) => b.timestamp - a.timestamp);
+    return { iso: pastSorted[0].entry, timestamp: pastSorted[0].timestamp };
+};
+
 const StatusCellRenderer = ({ data, node }: StatusCellRendererProps) => {
-    const { statusByService, summaryByType } = useServiceStatusContext();
+    const {
+        statusByService,
+        summaryByType,
+        statusStateByService,
+        scheduleByService,
+        scheduleStateByService,
+    } = useServiceStatusContext();
 
     if (node?.group) {
         const groupKey = String(node.key ?? '');
@@ -120,9 +201,68 @@ const StatusCellRenderer = ({ data, node }: StatusCellRendererProps) => {
     }
 
     const status = statusByService[serviceId];
+    const statusMeta = statusStateByService[serviceId];
+    const schedule = scheduleByService[serviceId];
+    const scheduleMeta = scheduleStateByService[serviceId];
 
     if (!status) {
-        return <span className="text-slate-400">Loading...</span>;
+        if (statusMeta?.isLoading) {
+            return <span className="text-slate-400">Loading...</span>;
+        }
+
+        if (statusMeta?.isError) {
+            if (data?.service_type !== 'Workflow') {
+                return <span className="text-slate-400">Status unavailable</span>;
+            }
+            if (scheduleMeta?.isLoading) {
+                return <span className="text-slate-400">Checking schedule...</span>;
+            }
+
+            if (schedule) {
+                if (schedule.paused) {
+                    return (
+                        <div className="flex flex-col">
+                            <span className="font-semibold text-slate-600">Paused</span>
+                            <span className="text-xs text-slate-500">Workflow schedule is paused</span>
+                        </div>
+                    );
+                }
+
+                const nextRunCandidate = selectNextUpcomingAction(schedule);
+                if (nextRunCandidate) {
+                    const formattedNextRun = formatHktDateTime(nextRunCandidate.iso) ?? {
+                        iso: nextRunCandidate.iso,
+                        label: nextRunCandidate.iso,
+                    };
+
+                    return (
+                        <div className="flex flex-col">
+                            <span className="font-semibold text-slate-600">
+                                Next run (HKT)
+                                {' '}
+                                <time dateTime={formattedNextRun.iso}>{formattedNextRun.label}</time>
+                            </span>
+                            <span className="text-xs text-slate-500">Status unavailable since last check</span>
+                        </div>
+                    );
+                }
+
+                return (
+                    <div className="flex flex-col">
+                        <span className="font-semibold text-slate-600">No recent status</span>
+                        <span className="text-xs text-slate-500">No upcoming runs scheduled</span>
+                    </div>
+                );
+            }
+
+            if (scheduleMeta?.isError) {
+                return <span className="text-slate-400">Schedule unavailable</span>;
+            }
+
+            return <span className="text-slate-400">Status unavailable</span>;
+        }
+
+        return <span className="text-slate-400">—</span>;
     }
 
     const statusDisplayMap: Record<number, { text: string; color: string }> = {
@@ -192,6 +332,28 @@ const ServiceListComponent = ({ services, onSelectService }: ServiceListProps) =
         })),
     });
 
+    const isWorkflowService = (service: ServiceNode | undefined): boolean => service?.service_type === 'Workflow';
+
+    const scheduleQueries = useQueries({
+        queries: services.map((service, index) => {
+            const statusQuery = statusQueries[index];
+            const shouldFetchSchedule = Boolean(service.service_id)
+                && isWorkflowService(service)
+                && Boolean(statusQuery?.isError);
+            return {
+                queryKey: ['workflowSchedule', service.service_id],
+                queryFn: () => fetchWorkflowScheduleSnapshot(service.service_id),
+                enabled: shouldFetchSchedule,
+                staleTime: 15 * 60 * 1000,
+                gcTime: 30 * 60 * 1000,
+                refetchOnWindowFocus: false,
+                refetchOnReconnect: false,
+                refetchOnMount: false,
+                retry: 0,
+            };
+        }),
+    });
+
     const statusMap = useMemo(() => {
         const map: Record<string, ServiceStatusSummary | undefined> = {};
         services.forEach((service, index) => {
@@ -199,6 +361,39 @@ const ServiceListComponent = ({ services, onSelectService }: ServiceListProps) =
         });
         return map;
     }, [services, statusQueries]);
+
+    const statusStateByService = useMemo(() => {
+        const map: Record<string, StatusMeta> = {};
+        services.forEach((service, index) => {
+            const query = statusQueries[index];
+            map[service.service_id] = {
+                isLoading: Boolean(query?.isLoading || query?.isFetching),
+                isError: Boolean(query?.isError),
+                error: query?.error ?? null,
+            };
+        });
+        return map;
+    }, [services, statusQueries]);
+
+    const scheduleMap = useMemo(() => {
+        const map: Record<string, WorkflowScheduleSnapshot | undefined> = {};
+        services.forEach((service, index) => {
+            map[service.service_id] = scheduleQueries[index]?.data;
+        });
+        return map;
+    }, [services, scheduleQueries]);
+
+    const scheduleStateByService = useMemo(() => {
+        const map: Record<string, ScheduleMeta> = {};
+        services.forEach((service, index) => {
+            const query = scheduleQueries[index];
+            map[service.service_id] = {
+                isLoading: Boolean(query?.isLoading || query?.isFetching),
+                isError: Boolean(query?.isError),
+            };
+        });
+        return map;
+    }, [services, scheduleQueries]);
 
     const statusSummaryByType = useMemo(() => {
         const summary: Record<string, StatusSummaryCounts> = {};
@@ -366,7 +561,15 @@ const ServiceListComponent = ({ services, onSelectService }: ServiceListProps) =
 
     return (
         <div className="h-full w-full font-sans overflow-hidden">
-            <ServiceStatusContext.Provider value={{ statusByService: statusMap, summaryByType: statusSummaryByType }}>
+            <ServiceStatusContext.Provider
+                value={{
+                    statusByService: statusMap,
+                    summaryByType: statusSummaryByType,
+                    statusStateByService,
+                    scheduleByService: scheduleMap,
+                    scheduleStateByService,
+                }}
+            >
                 <AgGridReact<ServiceRow>
                     columnDefs={columnDefs}
                     rowData={rowData}

@@ -364,28 +364,63 @@ class WorkflowStatusReport:
 
         return None
 
-    async def log_schedule_snapshot(
+    async def hydrate_schedule_metadata(self, schedule_id: str) -> dict[str, Optional[str]]:
+        """Load workflow type and task queue from Temporal schedule description."""
+        metadata: dict[str, Optional[str]] = {'workflow_type': None, 'task_queue': None}
+
+        if not schedule_id:
+            return metadata
+
+        try:
+            handle = self.client.get_schedule_handle(schedule_id)
+            description = await handle.describe()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Unable to describe schedule %s for metadata hydration: %s", schedule_id, exc)
+            return metadata
+
+        schedule_entry = getattr(description, 'schedule', None)
+        if schedule_entry:
+            metadata['workflow_type'] = self.extract_workflow_type(description)
+            metadata['task_queue'] = self.extract_task_queue(description)
+
+        return metadata
+
+    async def fetch_schedule_snapshot(
         self,
         schedule_id: Optional[str],
         schedule_entry: Any = None,
         interval_minute: Optional[int] = None,
         start_offset_minute: Optional[int] = None,
-    ) -> None:
-        """Log key schedule fields from Temporal for observability."""
+    ) -> Optional[dict[str, Any]]:
+        """Return key schedule data for observability and API usage."""
         if not schedule_id:
-            return
+            return None
 
         info = getattr(schedule_entry, 'info', None) if schedule_entry is not None else None
         description = None
+        resolved_schedule_entry = schedule_entry
+        resolved_workflow_type: Optional[str] = None
+        resolved_task_queue: Optional[str] = None
 
         if info is None:
             try:
                 handle = self.client.get_schedule_handle(schedule_id)
                 description = await handle.describe()
                 info = getattr(description, 'info', None)
+                resolved_schedule_entry = description
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("Unable to describe schedule %s: %s", schedule_id, exc)
-                return
+                return None
+
+        if resolved_schedule_entry is not None:
+            resolved_workflow_type = self.extract_workflow_type(resolved_schedule_entry)
+            resolved_task_queue = self.extract_task_queue(resolved_schedule_entry)
+
+        if schedule_entry is not None:
+            if not resolved_workflow_type:
+                resolved_workflow_type = self.extract_workflow_type(schedule_entry)
+            if not resolved_task_queue:
+                resolved_task_queue = self.extract_task_queue(schedule_entry)
 
         def compute_schedule_times(target_info: Any) -> tuple[list[datetime], list[datetime], Optional[datetime]]:
             if target_info is None:
@@ -418,29 +453,42 @@ class WorkflowStatusReport:
             completed_time = getattr(info, 'last_completed_action_time', None)
             if isinstance(completed_time, datetime):
                 if completed_time.tzinfo is None:
-                    last_completed = completed_time.replace(tzinfo=timezone.utc).isoformat()
+                    last_completed = completed_time.replace(tzinfo=timezone.utc)
                 else:
-                    last_completed = completed_time.astimezone(timezone.utc).isoformat()
+                    last_completed = completed_time.astimezone(timezone.utc)
 
-        recent_info = None
+        recent_runs: list[dict[str, Optional[str]]] = []
         if info is not None:
             try:
                 recent_actions = getattr(info, 'recent_actions', None)
                 if recent_actions:
-                    recent_info = [
-                        {
-                            'scheduled_at': getattr(action, 'scheduled_at', None).isoformat()
-                            if isinstance(getattr(action, 'scheduled_at', None), datetime) else None,
-                            'started_at': getattr(action, 'started_at', None).isoformat()
-                            if isinstance(getattr(action, 'started_at', None), datetime) else None,
-                            'action_type': type(getattr(action, 'action', None)).__name__ if getattr(action, 'action', None) else None,
-                        }
-                        for action in recent_actions[:3]
-                    ]
+                    for action in recent_actions[:3]:
+                        scheduled_at = getattr(action, 'scheduled_at', None)
+                        started_at = getattr(action, 'started_at', None)
+                        scheduled_iso = None
+                        started_iso = None
+                        if isinstance(scheduled_at, datetime):
+                            scheduled_iso = (
+                                scheduled_at.replace(tzinfo=timezone.utc).isoformat()
+                                if scheduled_at.tzinfo is None
+                                else scheduled_at.astimezone(timezone.utc).isoformat()
+                            )
+                        if isinstance(started_at, datetime):
+                            started_iso = (
+                                started_at.replace(tzinfo=timezone.utc).isoformat()
+                                if started_at.tzinfo is None
+                                else started_at.astimezone(timezone.utc).isoformat()
+                            )
+                        recent_runs.append({
+                            'scheduled_at': scheduled_iso,
+                            'started_at': started_iso,
+                            'action_type': type(getattr(action, 'action', None)).__name__
+                            if getattr(action, 'action', None)
+                            else None,
+                        })
             except TypeError:
-                recent_info = None
+                recent_runs = []
 
-        recent_runs = recent_info or []
         detected_interval, detected_offset = (None, None)
         if schedule_entry is not None:
             detected_interval, detected_offset = self.extract_interval_metadata(schedule_entry)
@@ -469,24 +517,59 @@ class WorkflowStatusReport:
 
         next_times = datetimes_to_strings(next_datetimes)
         future_times = datetimes_to_strings(future_datetimes)
-
         upcoming_preview = datetimes_to_strings(combined_upcoming)
         next_action_iso = next_action_dt.isoformat() if next_action_dt is not None else None
 
+        last_completed_iso = last_completed.isoformat() if last_completed is not None else None
+
+        snapshot = {
+            'schedule_id': schedule_id,
+            'paused': paused,
+            'interval_minute': interval_value,
+            'start_offset_minute': offset_value,
+            'next_action_time': next_action_iso,
+            'upcoming_action_times': upcoming_preview,
+            'recent_runs': recent_runs,
+            'last_completed_action_time': last_completed_iso,
+            'next_action_times': next_times,
+            'future_action_times': future_times,
+            'workflow_type': resolved_workflow_type,
+            'task_queue': resolved_task_queue,
+        }
+
+        return snapshot
+
+    async def log_schedule_snapshot(
+        self,
+        schedule_id: Optional[str],
+        schedule_entry: Any = None,
+        interval_minute: Optional[int] = None,
+        start_offset_minute: Optional[int] = None,
+    ) -> None:
+        """Log key schedule fields from Temporal for observability."""
+        snapshot = await self.fetch_schedule_snapshot(
+            schedule_id,
+            schedule_entry=schedule_entry,
+            interval_minute=interval_minute,
+            start_offset_minute=start_offset_minute,
+        )
+        if snapshot is None:
+            return
+
         recent_preview = [
             f"{entry.get('scheduled_at')}/{entry.get('started_at')}"
-            for entry in recent_runs[:3]
-        ] if recent_runs else []
+            for entry in snapshot.get('recent_runs', [])[:3]
+        ] if snapshot.get('recent_runs') else []
 
         logger.info(
             "Schedule %s paused=%s interval=%s offset=%s next=%s upcoming=%s last_completed=%s recent=%s",
-            schedule_id,
-            paused,
-            interval_value,
-            offset_value,
-            next_action_iso,
-            upcoming_preview,
-            last_completed,
+            snapshot.get('schedule_id'),
+            snapshot.get('paused'),
+            snapshot.get('interval_minute'),
+            snapshot.get('start_offset_minute'),
+            snapshot.get('next_action_time'),
+            snapshot.get('upcoming_action_times'),
+            snapshot.get('last_completed_action_time'),
             recent_preview,
         )
 
@@ -509,6 +592,23 @@ class WorkflowStatusReport:
 
             workflow_type = self.extract_workflow_type(entry)
             task_queue = self.extract_task_queue(entry)
+
+            hydrated_metadata: Optional[dict[str, Optional[str]]] = None
+            needs_hydration = (
+                bool(schedule_id)
+                and (
+                    not workflow_type
+                    or (workflow_type == schedule_id and not task_queue)
+                    or not task_queue
+                )
+            )
+
+            if needs_hydration and schedule_id:
+                hydrated_metadata = await self.hydrate_schedule_metadata(schedule_id)
+                if hydrated_metadata.get('workflow_type'):
+                    workflow_type = hydrated_metadata['workflow_type']
+                if not task_queue and hydrated_metadata.get('task_queue'):
+                    task_queue = hydrated_metadata['task_queue']
             if not workflow_type:
                 if schedule_id:
                     logger.debug(
@@ -565,19 +665,75 @@ class WorkflowStatusReport:
                 )
             )
 
-            await self.log_schedule_snapshot(monitor_schedule_id, entry)
-            logger.debug(
-                "Prepared monitor for schedule %s (workflow type %s) with interval %d minutes offset %d",
-                monitor_schedule_id,
-                workflow_type,
-                interval_minute,
-                offset_minute,
-            )
+            if hydrated_metadata and hydrated_metadata.get('workflow_type'):
+                logger.debug(
+                    "Hydrated schedule %s with workflow %s (task queue=%s)",
+                    monitor_schedule_id,
+                    hydrated_metadata.get('workflow_type'),
+                    task_queue,
+                )
+
+            # await self.log_schedule_snapshot(monitor_schedule_id, entry)
+            # logger.debug(
+            #     "Prepared monitor for schedule %s (workflow type %s) with interval %d minutes offset %d",
+            #     monitor_schedule_id,
+            #     workflow_type,
+            #     interval_minute,
+            #     offset_minute,
+            # )
 
         if monitors:
             logger.info("Synchronized %d Temporal workflow services", len(monitors))
 
         return monitors
+
+    async def get_workflow_schedule_info(self, service_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve schedule snapshot for a given workflow service id."""
+        try:
+            schedules_iterator = await self.client.list_schedules()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Failed to list Temporal schedules for service %s: %s", service_id, exc)
+            return None
+
+        async for entry in schedules_iterator:
+            schedule_id_raw = getattr(entry, 'id', None)
+            schedule_id = schedule_id_raw if isinstance(schedule_id_raw, str) and schedule_id_raw else None
+
+            workflow_type = self.extract_workflow_type(entry)
+            if schedule_id and (not workflow_type or workflow_type == schedule_id):
+                hydrated = await self.hydrate_schedule_metadata(schedule_id)
+                if hydrated.get('workflow_type'):
+                    workflow_type = hydrated['workflow_type']
+            matches_service = False
+            if workflow_type and workflow_type == service_id:
+                matches_service = True
+            if not matches_service and schedule_id and schedule_id == service_id:
+                matches_service = True
+
+            if not matches_service:
+                continue
+
+            interval_meta, start_offset = self.extract_interval_metadata(entry)
+            interval_minute = interval_meta or 15
+            offset_minute = start_offset if start_offset is not None else 0
+            if start_offset is not None and interval_meta:
+                offset_minute = start_offset % interval_minute
+            elif interval_meta is not None and interval_meta > 0:
+                offset_minute %= interval_minute
+            else:
+                offset_minute %= interval_minute or 1
+
+            snapshot = await self.fetch_schedule_snapshot(
+                schedule_id or workflow_type,
+                schedule_entry=entry,
+                interval_minute=interval_minute,
+                start_offset_minute=offset_minute,
+            )
+            if snapshot is not None:
+                snapshot.setdefault('workflow_type', workflow_type)
+                return snapshot
+
+        return None
 
     @staticmethod
     def id_to_datetime(workflow_id: str) -> datetime:
@@ -593,7 +749,7 @@ class WorkflowStatusReport:
         minute_aligned = self.monitor_time.replace(second=0, microsecond=0)
         reference = datetime(1970, 1, 1)
 
-        grace = timedelta(hours=2) if interval_minutes > 1440 else timedelta()
+        grace = timedelta(hours=1) if interval_minutes > 1440 else timedelta()
         adjusted_time = minute_aligned - grace
         if adjusted_time < reference:
             adjusted_time = reference
@@ -626,14 +782,18 @@ class WorkflowStatusReport:
 
         sanitized_schedule: Optional[str] = None
         if schedule_id:
-            sanitized_schedule = schedule_id.replace('"', '\"')
+            sanitized_schedule = schedule_id.replace('"', '\\"')
             queries.append((
                 'schedule_id',
                 f'WorkflowId STARTS_WITH "{sanitized_schedule}"',
             ))
+            queries.append((
+                'scheduled_by_id',
+                f'TemporalScheduledById="{sanitized_schedule}"',
+            ))
 
         if workflow_type:
-            sanitized_type = workflow_type.replace('"', '\"')
+            sanitized_type = workflow_type.replace('"', '\\"')
             # Avoid duplicate query when schedule id already equals workflow type
             if not sanitized_schedule or sanitized_type != sanitized_schedule:
                 queries.append((
@@ -647,7 +807,7 @@ class WorkflowStatusReport:
             for monitor in self.workflow_monitor_list:
                 if monitor.schedule_id == schedule_id or monitor.workflow_type == workflow_type:
                     if monitor.task_queue:
-                        task_queue_filter = monitor.task_queue.replace('"', '\"')
+                        task_queue_filter = monitor.task_queue.replace('"', '\\"')
                     break
 
         if task_queue_filter:
@@ -763,11 +923,11 @@ class WorkflowStatusReport:
             logger.warning("Report endpoint not configured; skipping status for %s", service_id)
             return "skipped_no_endpoint"
 
-        await self.log_schedule_snapshot(
-            schedule_id,
-            interval_minute=interval_minute,
-            start_offset_minute=start_offset_minute,
-        )
+        # await self.log_schedule_snapshot(
+        #     schedule_id,
+        #     interval_minute=interval_minute,
+        #     start_offset_minute=start_offset_minute,
+        # )
 
         window_start, due_time, grace = self.compute_monitor_window(interval_minute, start_offset_minute)
         if interval_minute > 1440 and self.monitor_time < due_time + grace:
@@ -961,7 +1121,7 @@ class WorkflowStatusReport:
 if __name__ == "__main__":
     async def run():
         client: Client = await Client.connect("temporal-frontend-headless.temporal.svc.cluster.local:7233", namespace="default")
-        report_endpoint = 'http://localhost:14306'
+        report_endpoint = 'http://localhost:14307'
         status_report = WorkflowStatusReport(client, report_endpoint)
         await status_report.run_report_status()
 

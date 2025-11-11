@@ -29,3 +29,20 @@ export interface ServiceFailureRecord {
 export interface Notification {
     service_id: string
 }
+
+export interface WorkflowRecentRun {
+    scheduled_at?: string | null
+    started_at?: string | null
+    action_type?: string | null
+}
+
+export interface WorkflowScheduleSnapshot {
+    schedule_id: string
+    paused: boolean
+    interval_minute?: number | null
+    start_offset_minute?: number | null
+    next_action_time?: string | null
+    upcoming_action_times: string[]
+    last_completed_action_time?: string | null
+    recent_runs: WorkflowRecentRun[]
+}

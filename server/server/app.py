@@ -43,6 +43,25 @@ class AlertmanagerPayload(BaseModel):
     status: str
     externalURL: str
 
+
+class WorkflowRecentRun(BaseModel):
+    scheduled_at: Optional[str]
+    started_at: Optional[str]
+    action_type: Optional[str]
+
+
+class WorkflowScheduleSnapshot(BaseModel):
+    schedule_id: str
+    paused: bool
+    interval_minute: Optional[int]
+    start_offset_minute: Optional[int]
+    next_action_time: Optional[str]
+    upcoming_action_times: List[str]
+    last_completed_action_time: Optional[str]
+    recent_runs: List[WorkflowRecentRun]
+    workflow_type: Optional[str]
+    task_queue: Optional[str]
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -520,6 +539,52 @@ def get_service_status(service_id: str, start: Optional[str] = None, end: Option
             status_code=500,
             detail=f"Failed to retrieve service status: {str(e)}"
         )
+
+
+@app.get('/api/workflows/{service_id}/schedule', response_model=WorkflowScheduleSnapshot)
+async def get_workflow_schedule_snapshot(service_id: str):
+    """Retrieve next scheduled run information for a workflow service."""
+    try:
+        client: Client = await Client.connect(
+            "temporal-frontend-headless.temporal.svc.cluster.local:7233",
+            namespace="default",
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.error("Failed to connect to Temporal for service %s: %s", service_id, exc)
+        raise HTTPException(status_code=500, detail="Unable to connect to Temporal service") from exc
+
+    try:
+        status_report = WorkflowStatusReport(client)
+        snapshot = await status_report.get_workflow_schedule_info(service_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"No schedule found for service {service_id}")
+
+        recent_runs_payload = [
+            WorkflowRecentRun(**run)
+            for run in snapshot.get('recent_runs', [])
+            if isinstance(run, dict)
+        ]
+
+        response_payload = WorkflowScheduleSnapshot(
+            schedule_id=snapshot.get('schedule_id') or service_id,
+            paused=bool(snapshot.get('paused')),
+            interval_minute=snapshot.get('interval_minute'),
+            start_offset_minute=snapshot.get('start_offset_minute'),
+            next_action_time=snapshot.get('next_action_time'),
+            upcoming_action_times=snapshot.get('upcoming_action_times') or [],
+            last_completed_action_time=snapshot.get('last_completed_action_time'),
+            recent_runs=recent_runs_payload,
+            workflow_type=snapshot.get('workflow_type'),
+            task_queue=snapshot.get('task_queue'),
+        )
+
+        return response_payload
+    finally:
+        close_callable = getattr(client, 'close', None)
+        if callable(close_callable):
+            close_result = close_callable()
+            if asyncio.iscoroutine(close_result):
+                await close_result
 
 @app.get('/status/{service_id}/failures', response_model=List[ServiceFailureRecord])
 def get_recent_service_failures(service_id: str, limit: int = 5, start: Optional[str] = None, end: Optional[str] = None):
@@ -1453,7 +1518,7 @@ async def periodic_workflow_report():
         try:
             client: Client = await Client.connect("temporal-frontend-headless.temporal.svc.cluster.local:7233",
                                                     namespace="default")
-            report_endpoint = 'http://localhost:14306' 
+            report_endpoint = 'http://localhost:14306'
             status_report = WorkflowStatusReport(client, report_endpoint)
             await status_report.run_report_status()
             
